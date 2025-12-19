@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+DOMgrab.py — Active webapp mapping (framework hints, security header signals, DOM inventory)
+and generation of a safe Playwright demo spec.
+
+Now supports authenticated sessions via Bearer token or session cookie.
+"""
+
+import argparse
+import json
+import re
+import time
+from urllib.parse import urlparse, urljoin
+
+from playwright.sync_api import sync_playwright
+
+TECH_PATTERNS = {
+    "Next.js": [re.compile(r"/_next/"), re.compile(r"__NEXT_DATA__")],
+    "React": [re.compile(r"react", re.I), re.compile(r"data-reactroot|data-reactid", re.I)],
+    "Vue": [re.compile(r"vue", re.I), re.compile(r"data-v-", re.I)],
+    "Angular": [re.compile(r"angular", re.I), re.compile(r"ng-version|_ngcontent", re.I)],
+    "Svelte": [re.compile(r"svelte", re.I)],
+    "Nuxt": [re.compile(r"nuxt", re.I)],
+}
+
+COMMON_ENTRY_PATHS = ["/", "/login", "/signin", "/admin", "/app", "/ui"]
+
+
+def stable_selector_candidates(el: dict) -> list[str]:
+    attrs = el.get("attrs", {}) or {}
+    cands: list[str] = []
+    for k in ("data-testid", "data-test", "data-qa"):
+        if attrs.get(k):
+            cands.append(f'[{k}="{attrs[k]}"]')
+    if attrs.get("id"):
+        cands.append(f'#{attrs["id"]}')
+    if attrs.get("name"):
+        cands.append(f'[name="{attrs["name"]}"]')
+    if attrs.get("aria-label"):
+        cands.append(f'[aria-label="{attrs["aria-label"]}"]')
+    return cands[:5]
+
+
+def generate_playwright_demo(base_url: str, dom_map: list[dict], out_file: str) -> str:
+    preview = [{"role": i.get("role"), "name": i.get("name"), "tag": i.get("tag")} for i in dom_map[:80]]
+    return f"""\
+/**
+ * Generated UI demo (safe automation).
+ * Target: {base_url}
+ *
+ * Run:
+ *   npm i -D @playwright/test
+ *   npx playwright install
+ *   TARGET_URL="{base_url}" npx playwright test {out_file}
+ */
+
+const {{ test, expect }} = require('@playwright/test');
+
+test('Load and inventory UI', async ({{ page }}) => {{
+  const url = process.env.TARGET_URL || '{base_url}';
+  await page.goto(url, {{ waitUntil: 'domcontentloaded' }});
+  await expect(page).toHaveURL(/.*/);
+
+  console.log('--- UI Inventory (role/name) ---');
+  const items = {json.dumps(preview, indent=2)};
+  for (const it of items) {{
+    console.log(`${{it.role || 'n/a'}} :: "${{it.name || ''}}" :: <${{it.tag}}>`);
+  }}
+}});
+
+test('Demo: safe interactions (edit these)', async ({{ page }}) => {{
+  const url = process.env.TARGET_URL || '{base_url}';
+  await page.goto(url, {{ waitUntil: 'domcontentloaded' }});
+
+  // Replace the examples below with elements that exist in your training app / permitted target.
+  // Preferred selectors (in order):
+  //  1) getByTestId('...')
+  //  2) getByRole('button', {{ name: /.../i }})
+  //  3) getByLabel(/.../i)
+
+  // Example patterns:
+  // await page.getByRole('button', {{ name: /sign in|login/i }}).click();
+  // await page.getByLabel(/email/i).fill('student@example.com');
+  // await page.getByLabel(/password/i).fill('REDACTED');
+  // await page.getByRole('button', {{ name: /submit|continue/i }}).click();
+
+  await expect(page.getByRole('button').first()).toBeVisible();
+}});
+"""
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Map webapp UI and generate safe Playwright demo")
+    ap.add_argument("url", help="Base URL (include scheme), e.g. https://example.com")
+    ap.add_argument("--max-pages", type=int, default=3, help="How many entry paths to try")
+    ap.add_argument("--timeout", type=int, default=15000, help="Navigation timeout (ms)")
+    ap.add_argument("--out-prefix", default="domgrab", help="Output file prefix")
+    ap.add_argument("--headful", action="store_true", help="Run browser headful (non-headless)")
+    ap.add_argument("--settle-ms", type=int, default=750, help="Post-navigation settle delay (ms)")
+
+    # === Authentication options ===
+    ap.add_argument("--bearer-token", type=str, default=None,
+                    help="Bearer token for Authorization header (e.g. JWT or API token)")
+    ap.add_argument("--cookie-name", type=str, default=None,
+                    help="Name of session cookie to set (use with --cookie-value)")
+    ap.add_argument("--cookie-value", type=str, default=None,
+                    help="Value of session cookie to set (use with --cookie-name)")
+
+    args = ap.parse_args()
+
+    # Basic validation for cookie pair
+    if bool(args.cookie_name) != bool(args.cookie_value):
+        raise SystemExit("Error: --cookie-name and --cookie-value must be used together.")
+
+    base = args.url.rstrip("/")
+    parsed = urlparse(base)
+    if not parsed.scheme:
+        raise SystemExit("URL must include scheme (http:// or https://)")
+
+    report: dict = {
+        "base_url": base,
+        "timestamp": int(time.time()),
+        "pages": [],
+        "tech_hints": {},
+        "security_headers": {},
+        "cookies": [],
+        "observed_requests": [],
+        "observed_apis": [],
+        "auth_method": None,
+    }
+
+    dom_inventory: list[dict] = []
+
+    with sync_playwright() as p:
+        browser_args = {}
+        if not args.headful:
+            browser_args["headless"] = True
+
+        browser = p.chromium.launch(**browser_args)
+        
+        # Create context with optional auth headers/cookies
+        context_args = {
+            "ignore_https_errors": True,
+        }
+
+        # Add Authorization header if bearer token provided
+        if args.bearer_token:
+            context_args["extra_http_headers"] = {
+                "Authorization": f"Bearer {args.bearer_token.strip()}"
+            }
+            report["auth_method"] = "bearer_token"
+
+        context = browser.new_context(**context_args)
+
+        # Set session cookie if provided
+        if args.cookie_name and args.cookie_value:
+            cookie = {
+                "name": args.cookie_name,
+                "value": args.cookie_value,
+                "domain": parsed.hostname,
+                "path": "/",
+                "expires": -1,  # session cookie
+                "httpOnly": False,
+                "secure": parsed.scheme == "https",
+                "sameSite": "Lax"
+            }
+            context.add_cookies([cookie])
+            report["auth_method"] = report.get("auth_method", "session_cookie") if not report["auth_method"] else "bearer+cookie"
+
+        page = context.new_page()
+
+        # Capture responses for endpoint/API surface mapping
+        def on_response(resp):
+            try:
+                url = resp.url
+                status = resp.status
+                ct = (resp.headers or {}).get("content-type", "")
+                report["observed_requests"].append({"url": url, "status": status, "content_type": ct})
+                if any(x in url for x in ("/api", "/graphql", "/v1", "/v2")) or ("application/json" in (ct or "")):
+                    report["observed_apis"].append({"url": url, "status": status, "content_type": ct})
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+        tried = 0
+        for path in COMMON_ENTRY_PATHS:
+            if tried >= args.max_pages:
+                break
+            url = urljoin(base + "/", path.lstrip("/"))
+            tried += 1
+
+            try:
+                resp = page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
+            except Exception as e:
+                report["pages"].append({"url": url, "error": "navigation_failed", "details": str(e)})
+                continue
+
+            page_entry = {"url": url, "title": page.title(), "status": resp.status if resp else None}
+
+            # ---- SAFE BODY ACQUISITION ----
+            body = ""
+            if resp:
+                try:
+                    body = resp.text()
+                except Exception:
+                    pass
+            if not body:
+                try:
+                    body = page.content()
+                except Exception:
+                    pass
+
+            try:
+                page.wait_for_timeout(args.settle_ms)
+            except Exception:
+                pass
+
+            # Security headers
+            if resp:
+                hdrs = resp.headers or {}
+                for k in (
+                    "content-security-policy",
+                    "strict-transport-security",
+                    "x-frame-options",
+                    "x-content-type-options",
+                    "referrer-policy",
+                    "permissions-policy",
+                ):
+                    if k in hdrs and k not in report["security_headers"]:
+                        report["security_headers"][k] = hdrs[k]
+
+                page_entry["headers_subset"] = {
+                    k: hdrs.get(k) for k in ("server", "content-type", "x-powered-by") if hdrs.get(k)
+                }
+
+            # Cookie summary
+            try:
+                cookies = context.cookies()
+                report["cookies"] = list({c["name"] for c in cookies})
+            except Exception:
+                pass
+
+            # Tech hints
+            try:
+                assets = page.eval_on_selector_all(
+                    "script[src],link[href]",
+                    "els => els.map(e => e.getAttribute('src') || e.getAttribute('href')).filter(Boolean)"
+                )
+            except Exception:
+                assets = []
+
+            haystack = (body or "") + "\n" + "\n".join(assets or [])
+            for tech, rxs in TECH_PATTERNS.items():
+                for rx in rxs:
+                    if rx.search(haystack):
+                        report["tech_hints"].setdefault(tech, 0)
+                        report["tech_hints"][tech] += 1
+
+            report["pages"].append(page_entry)
+
+            # DOM inventory
+            try:
+                items = page.evaluate(
+                    """
+                    () => {
+                      const pickAttrs = (el) => {
+                        const attrs = {};
+                        for (const a of el.getAttributeNames()) {
+                          if (['id','name','aria-label','data-testid','data-test','data-qa','type','role'].includes(a)) {
+                            attrs[a] = el.getAttribute(a);
+                          }
+                        }
+                        return attrs;
+                      };
+
+                      const roleOf = (el) => el.getAttribute('role') || el.tagName.toLowerCase();
+
+                      const nameOf = (el) => {
+                        const al = el.getAttribute('aria-label');
+                        if (al) return al.trim();
+                        const t = (el.innerText || el.textContent || '').trim();
+                        return t.replace(/\\s+/g,' ').slice(0,80);
+                      };
+
+                      const els = Array.from(document.querySelectorAll('a,button,input,select,textarea,[role]'))
+                        .filter(el => {
+                          const tag = el.tagName.toLowerCase();
+                          if (tag === 'input') return !['hidden'].includes((el.getAttribute('type')||'').toLowerCase());
+                          return true;
+                        })
+                        .slice(0, 250);
+
+                      return els.map(el => ({
+                        tag: el.tagName.toLowerCase(),
+                        role: roleOf(el),
+                        name: nameOf(el),
+                        attrs: pickAttrs(el)
+                      }));
+                    }
+                    """
+                )
+                dom_inventory.extend(items or [])
+            except Exception:
+                pass
+
+        browser.close()
+
+    # Deduplicate DOM inventory
+    seen = set()
+    deduped: list[dict] = []
+    for el in dom_inventory:
+        key = (el.get("role", ""), el.get("name", ""), el.get("tag", ""), (el.get("attrs", {}) or {}).get("id", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        el["selector_candidates"] = stable_selector_candidates(el)
+        deduped.append(el)
+
+    out_prefix = args.out_prefix
+    report_path = f"{out_prefix}_report.json"
+    dom_path = f"{out_prefix}_dom_map.json"
+    demo_file = f"{out_prefix}_generated_demo.spec.js"
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    with open(dom_path, "w", encoding="utf-8") as f:
+        json.dump(deduped, f, indent=2)
+    with open(demo_file, "w", encoding="utf-8") as f:
+        f.write(generate_playwright_demo(base, deduped, demo_file))
+
+    print(f"Wrote {report_path}")
+    print(f"Wrote {dom_path}")
+    print(f"Wrote {demo_file}")
+    if report.get("tech_hints"):
+        print("Tech hints:", ", ".join(sorted(report["tech_hints"].keys())))
+    else:
+        print("Tech hints: none")
+    if report.get("auth_method"):
+        print(f"Used authentication: {report['auth_method']}")
+
+
+if __name__ == "__main__":
+    main()
