@@ -1,0 +1,497 @@
+#!/usr/bin/env python3
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urljoin, urlparse, urldefrag
+
+from playwright.async_api import async_playwright, Page, BrowserContext
+
+
+# -----------------------------
+# Hard-coded defaults (overrideable)
+# -----------------------------
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+)
+DEFAULT_ACCEPT = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
+    "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+)
+DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def canonicalize_url(url: str) -> str:
+    # normalize fragments away
+    url, _frag = urldefrag(url)
+    return url
+
+
+def same_origin(a: str, b: str) -> bool:
+    pa, pb = urlparse(a), urlparse(b)
+    return (pa.scheme, pa.hostname, pa.port) == (pb.scheme, pb.hostname, pb.port)
+
+
+def base_domain(host: str) -> str:
+    """
+    Best-effort base domain for subdomain scoping without guessing TLD lists.
+    For your stated requirement ("all subdomains under our domain"), you can also
+    just pass --site-domain yourcorp.com explicitly.
+    """
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    return ".".join(parts[-2:])
+
+
+def host_endswith(host: str, suffix: str) -> bool:
+    host = (host or "").lower()
+    suffix = (suffix or "").lower().lstrip(".")
+    return host == suffix or host.endswith("." + suffix)
+
+
+def parse_cookie_kv(s: str) -> Tuple[str, str]:
+    if "=" not in s:
+        raise ValueError("Cookie must be NAME=VALUE")
+    name, val = s.split("=", 1)
+    name, val = name.strip(), val.strip()
+    if not name or not val:
+        raise ValueError("Cookie must be NAME=VALUE with non-empty name and value")
+    return name, val
+
+
+def parse_header_kv(s: str) -> Tuple[str, str]:
+    if ":" not in s:
+        raise ValueError("Header must be 'Name: Value'")
+    k, v = s.split(":", 1)
+    k, v = k.strip(), v.strip()
+    if not k or not v:
+        raise ValueError("Header must be 'Name: Value' with non-empty values")
+    return k, v
+
+
+# -----------------------------
+# Data model
+# -----------------------------
+@dataclass
+class EndpointRecord:
+    url: str
+    method: str
+    status: Optional[int] = None
+    content_type: Optional[str] = None
+    final_url: Optional[str] = None
+    title: Optional[str] = None
+    html_sha256: Optional[str] = None
+    dom_sha256: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class CrawlReport:
+    root: str
+    role: str
+    visited: List[str]
+    endpoint_index: Dict[str, EndpointRecord]
+    xhr_index: Dict[str, Dict[str, Any]]
+    node_count: int
+    edge_count: int
+    edges: List[Tuple[str, str]]
+
+
+# -----------------------------
+# DOM extraction (no guessing; only what’s in source/DOM)
+# -----------------------------
+JS_EXTRACT_LINKS = r"""
+() => {
+  const out = new Set();
+
+  function add(u) {
+    if (!u) return;
+    try { out.add(String(u)); } catch(e) {}
+  }
+
+  // Standard anchors
+  for (const a of document.querySelectorAll("a[href]")) add(a.getAttribute("href"));
+
+  // Forms
+  for (const f of document.querySelectorAll("form[action]")) add(f.getAttribute("action"));
+
+  // Script/link/image assets sometimes encode API paths as well
+  for (const s of document.querySelectorAll("script[src]")) add(s.getAttribute("src"));
+  for (const l of document.querySelectorAll("link[href]")) add(l.getAttribute("href"));
+  for (const i of document.querySelectorAll("img[src]")) add(i.getAttribute("src"));
+
+  // Common data-* attributes and inline handlers that contain URLs
+  const urlishAttrs = ["data-href", "data-url", "data-endpoint", "data-action", "href", "src"];
+  for (const el of document.querySelectorAll("*")) {
+    for (const attr of urlishAttrs) {
+      if (el.hasAttribute && el.hasAttribute(attr)) add(el.getAttribute(attr));
+    }
+  }
+
+  // Also scan raw HTML for obvious URL patterns (still "inspect source", not brute forcing)
+  // Keep conservative: only capture things that look like paths/urls
+  const html = document.documentElement.outerHTML || "";
+  const re = /(?:https?:\/\/[^\s"'<>]+|\/[A-Za-z0-9._~!$&'()*+,;=:@\/%-]+)/g;
+  const m = html.match(re) || [];
+  for (const x of m) add(x);
+
+  return Array.from(out);
+}
+"""
+
+
+def normalize_discovered_url(root: str, discovered: str) -> Optional[str]:
+    discovered = (discovered or "").strip()
+    if not discovered:
+        return None
+    # Ignore javascript:, mailto:, tel:
+    lower = discovered.lower()
+    if lower.startswith("javascript:") or lower.startswith("mailto:") or lower.startswith("tel:"):
+        return None
+    # Resolve relative URLs against current root
+    abs_url = urljoin(root, discovered)
+    abs_url = canonicalize_url(abs_url)
+    return abs_url
+
+
+# -----------------------------
+# Scope policy (your requirement: include subdomains in-scope)
+# -----------------------------
+def in_scope(url: str, root: str, site_domain: Optional[str], allow_origins: List[str], deny_origins: List[str]) -> bool:
+    pu, pr = urlparse(url), urlparse(root)
+    if pu.scheme not in ("http", "https"):
+        return False
+
+    # Explicit deny
+    for d in deny_origins:
+        try:
+            pd = urlparse(d)
+            if pu.scheme == pd.scheme and pu.hostname == pd.hostname and (pu.port == pd.port):
+                return False
+        except Exception:
+            pass
+
+    # Explicit allow wins
+    for a in allow_origins:
+        try:
+            pa = urlparse(a)
+            if pu.scheme == pa.scheme and pu.hostname == pa.hostname and (pu.port == pa.port):
+                return True
+        except Exception:
+            pass
+
+    # Default: same "site domain" (subdomains allowed)
+    host = pu.hostname or ""
+    if site_domain:
+        return host_endswith(host, site_domain)
+    # fallback: derive base domain from root host
+    return host_endswith(host, base_domain(pr.hostname or ""))
+
+
+# -----------------------------
+# Crawl engine
+# -----------------------------
+async def apply_auth(context: BrowserContext, root: str, bearer: Optional[str], cookies: List[Tuple[str, str]]) -> None:
+    # Bearer token handled via headers in context setup (preferred).
+    # Cookies: set for root hostname and path "/"
+    if not cookies:
+        return
+    parsed = urlparse(root)
+    domain = parsed.hostname
+    if not domain:
+        return
+    cookie_objs = []
+    for (name, value) in cookies:
+        cookie_objs.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": "/",
+                "expires": -1,
+                "httpOnly": False,
+                "secure": parsed.scheme == "https",
+                "sameSite": "Lax",
+            }
+        )
+    await context.add_cookies(cookie_objs)
+
+
+async def crawl_role(
+    root: str,
+    role: str,
+    bearer: Optional[str],
+    cookies: List[Tuple[str, str]],
+    max_pages: int,
+    timeout_ms: int,
+    settle_ms: int,
+    headful: bool,
+    site_domain: Optional[str],
+    allow_origins: List[str],
+    deny_origins: List[str],
+    user_agent: str,
+    accept: str,
+    accept_language: str,
+    extra_headers: List[Tuple[str, str]],
+    include_xhr_cross_origin: bool,
+) -> CrawlReport:
+    visited: Set[str] = set()
+    edges: List[Tuple[str, str]] = []
+    endpoint_index: Dict[str, EndpointRecord] = {}
+    xhr_index: Dict[str, Dict[str, Any]] = {}
+
+    # Build default headers (overrideable)
+    headers: Dict[str, str] = {
+        "Accept": accept,
+        "Accept-Language": accept_language,
+        "Upgrade-Insecure-Requests": "1",
+    }
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    # Apply user-provided extra headers
+    for k, v in extra_headers:
+        headers[k] = v
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=not headful)
+        context = await browser.new_context(
+            user_agent=user_agent,
+            extra_http_headers=headers,
+        )
+
+        await apply_auth(context, root, bearer, cookies)
+
+        page = await context.new_page()
+        page.set_default_timeout(timeout_ms)
+
+        # Capture XHR/fetch responses as telemetry
+        def on_response(resp):
+            try:
+                rurl = canonicalize_url(resp.url)
+                rtype = resp.request.resource_type
+                # We record XHR/fetch always; crawl only scope-qualified later.
+                if rtype in ("xhr", "fetch"):
+                    pu = urlparse(rurl)
+                    pr = urlparse(root)
+                    same_site = host_endswith(pu.hostname or "", site_domain or base_domain(pr.hostname or ""))
+                    if same_site or include_xhr_cross_origin:
+                        key = f"{resp.request.method} {rurl}"
+                        xhr_index[key] = {
+                            "url": rurl,
+                            "method": resp.request.method,
+                            "status": resp.status,
+                            "resource_type": rtype,
+                            "content_type": resp.headers.get("content-type"),
+                        }
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+        q: List[str] = [canonicalize_url(root)]
+        while q and len(visited) < max_pages:
+            current = q.pop(0)
+            if current in visited:
+                continue
+            if not in_scope(current, root, site_domain, allow_origins, deny_origins):
+                continue
+
+            visited.add(current)
+            rec = EndpointRecord(url=current, method="GET")
+            try:
+                resp = await page.goto(current, wait_until="domcontentloaded")
+                await page.wait_for_timeout(settle_ms)
+                rec.final_url = canonicalize_url(page.url)
+                rec.title = await page.title()
+                if resp is not None:
+                    rec.status = resp.status
+                    rec.content_type = resp.headers.get("content-type")
+                # Capture HTML + DOM hashes (engineering-reviewable diffs)
+                html = await page.content()
+                rec.html_sha256 = sha256_text(html)
+                # DOM snapshot (outerHTML already approximates; we hash separately anyway)
+                dom = await page.evaluate("() => document.documentElement.outerHTML || ''")
+                rec.dom_sha256 = sha256_text(dom)
+
+                # Extract links strictly from source/DOM (no bruteforce)
+                raw_links = await page.evaluate(JS_EXTRACT_LINKS)
+                new_links: List[str] = []
+                for rl in raw_links:
+                    norm = normalize_discovered_url(rec.final_url or current, rl)
+                    if not norm:
+                        continue
+                    if not in_scope(norm, root, site_domain, allow_origins, deny_origins):
+                        continue
+                    new_links.append(norm)
+
+                # Record edges
+                for nl in new_links:
+                    edges.append((current, nl))
+                    if nl not in visited and nl not in q:
+                        q.append(nl)
+
+            except Exception as e:
+                rec.error = str(e)
+
+            endpoint_index[current] = rec
+
+        await context.close()
+        await browser.close()
+
+    report = CrawlReport(
+        root=root,
+        role=role,
+        visited=sorted(list(visited)),
+        endpoint_index={k: v for k, v in endpoint_index.items()},
+        xhr_index=xhr_index,
+        node_count=len(visited),
+        edge_count=len(edges),
+        edges=edges,
+    )
+    return report
+
+
+def serialize_report(report: CrawlReport) -> Dict[str, Any]:
+    out = asdict(report)
+    # Convert endpoint_index EndpointRecord dataclasses
+    out["endpoint_index"] = {k: asdict(v) for k, v in report.endpoint_index.items()}
+    return out
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="DOMgrabV5 - behavioral authorization mapper (link/DOM-driven traversal, no guessing)."
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("discover", help="Discover application surface for one role (cookie/bearer optional).")
+    d.add_argument("url", help="Root URL to start from (e.g., https://app.example.com)")
+    d.add_argument("--role", default="default", help="Label for this role (used in output files).")
+
+    # Auth
+    d.add_argument("--bearer-token", default=None, help="Bearer token (optional).")
+    d.add_argument("--cookie-name", default=None, help="Cookie name (legacy).")
+    d.add_argument("--cookie-value", default=None, help="Cookie value (legacy).")
+    d.add_argument(
+        "--cookie",
+        action="append",
+        default=[],
+        help="Repeatable: supply cookies as NAME=VALUE (recommended). Example: --cookie SESSION=abc",
+    )
+
+    # Scope
+    d.add_argument(
+        "--site-domain",
+        default=None,
+        help="Treat this domain and all subdomains as in-scope (e.g., example.com). If omitted, derived from root host.",
+    )
+    d.add_argument("--allow-origin", action="append", default=[], help="Repeatable allowlist origin (scheme+host).")
+    d.add_argument("--deny-origin", action="append", default=[], help="Repeatable denylist origin (scheme+host).")
+    d.add_argument(
+        "--include-xhr-cross-origin",
+        action="store_true",
+        help="Record cross-origin XHR/fetch as telemetry (does not crawl them).",
+    )
+
+    # Runtime
+    d.add_argument("--max-pages", type=int, default=200, help="Maximum pages to visit.")
+    d.add_argument("--timeout", type=int, default=30000, help="Navigation/action timeout in ms.")
+    d.add_argument("--settle-ms", type=int, default=800, help="Delay after domcontentloaded to allow SPA hydration.")
+    d.add_argument("--headful", action="store_true", help="Run browser headful (debug).")
+    d.add_argument("--out-prefix", default="domgrab", help="Output prefix (files will be <prefix>.<role>.json).")
+
+    # Hard-coded defaults with override options
+    d.add_argument("--user-agent", default=DEFAULT_UA, help="User-Agent header (default is Chrome/Windows UA).")
+    d.add_argument("--accept", default=DEFAULT_ACCEPT, help="Accept header (default is browser-like).")
+    d.add_argument("--accept-language", default=DEFAULT_ACCEPT_LANGUAGE, help="Accept-Language header.")
+    d.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        help="Repeatable extra header: 'Name: Value' (overrides defaults if same key).",
+    )
+
+    return p
+
+
+async def main_async(args: argparse.Namespace) -> int:
+    if args.cmd != "discover":
+        print("Only 'discover' is implemented in this streamlined build.", file=sys.stderr)
+        return 2
+
+    root = canonicalize_url(args.url)
+
+    # Cookies: prefer --cookie; support legacy --cookie-name/value
+    cookies: List[Tuple[str, str]] = []
+    for c in args.cookie:
+        cookies.append(parse_cookie_kv(c))
+    if args.cookie_name and args.cookie_value:
+        cookies.append((args.cookie_name, args.cookie_value))
+
+    extra_headers: List[Tuple[str, str]] = []
+    for h in args.header:
+        extra_headers.append(parse_header_kv(h))
+
+    report = await crawl_role(
+        root=root,
+        role=args.role,
+        bearer=args.bearer_token,
+        cookies=cookies,
+        max_pages=args.max_pages,
+        timeout_ms=args.timeout,
+        settle_ms=args.settle_ms,
+        headful=args.headful,
+        site_domain=args.site_domain,
+        allow_origins=args.allow_origin,
+        deny_origins=args.deny_origin,
+        user_agent=args.user_agent,
+        accept=args.accept,
+        accept_language=args.accept_language,
+        extra_headers=extra_headers,
+        include_xhr_cross_origin=args.include_xhr_cross_origin,
+    )
+
+    out_obj = serialize_report(report)
+    out_file = f"{args.out_prefix}.{args.role}.json"
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(out_obj, f, indent=2)
+
+    # Short console summary
+    # (This is where you should have seen more than 1 node if auth/headers worked.)
+    root_rec = out_obj["endpoint_index"].get(root) or out_obj["endpoint_index"].get(root.rstrip("/"))
+    status = root_rec.get("status") if root_rec else None
+    title = root_rec.get("title") if root_rec else None
+    print(f"[+] Wrote {out_file}")
+    print(f"[+] Visited pages: {out_obj['node_count']}  Edges: {out_obj['edge_count']}  XHR: {len(out_obj['xhr_index'])}")
+    print(f"[+] Root status: {status}  title: {title}")
+    return 0
+
+
+def main() -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    try:
+        return asyncio.run(main_async(args))
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
