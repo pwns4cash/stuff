@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# AuthMap.py
+# 
+# An authenticated, source-driven application behavior mapper used to derive authorization expectations and detect enforcement gaps.
+#
+#  python3 AuthMap.py --cookie session=xxxxxxxxxxxxxxxxxx --scope-mode same-host https://example.com
+
 import argparse
 import asyncio
 import json
