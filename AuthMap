@@ -1,497 +1,319 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
-import hashlib
 import json
-import os
 import re
-import sys
+import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Set, Tuple
+from html import unescape
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse, urldefrag
 
-from playwright.async_api import async_playwright, Page, BrowserContext
+import httpx
+from bs4 import BeautifulSoup
 
+DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+DEFAULT_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+DEFAULT_ACCEPT_LANG = "en-US,en;q=0.9"
 
-# -----------------------------
-# Hard-coded defaults (overrideable)
-# -----------------------------
-DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-)
-DEFAULT_ACCEPT = (
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
-    "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
-)
-DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+# --- Extraction regexes (source-driven; no guessing) ---
+# URLs inside JS: fetch("..."), axios.get("..."), $.ajax({url:"..."}), XHR.open("GET","...")
+JS_URL_PATTERNS = [
+    re.compile(r"""fetch\(\s*(['"])(/[^'"]+)\1"""),
+    re.compile(r"""axios\.(get|post|put|delete|patch)\(\s*(['"])(/[^'"]+)\2""", re.IGNORECASE),
+    re.compile(r"""\.open\(\s*(['"])(GET|POST|PUT|DELETE|PATCH)\1\s*,\s*(['"])(/[^'"]+)\3""", re.IGNORECASE),
+    re.compile(r"""url\s*:\s*(['"])(/[^'"]+)\1""", re.IGNORECASE),
+]
 
+# Generic route-like string literals in JS bundles (kept conservative):
+# - must start with /
+# - avoid obvious static assets
+ROUTE_LITERAL = re.compile(r"""(['"])(/[^'"]{2,200})\1""")
+STATIC_EXT = re.compile(r"""\.(png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|css|map)$""", re.IGNORECASE)
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
-
-
-def canonicalize_url(url: str) -> str:
-    # normalize fragments away
-    url, _frag = urldefrag(url)
-    return url
-
-
-def same_origin(a: str, b: str) -> bool:
-    pa, pb = urlparse(a), urlparse(b)
-    return (pa.scheme, pa.hostname, pa.port) == (pb.scheme, pb.hostname, pb.port)
-
+@dataclass
+class Endpoint:
+    url: str
+    discovered_from: List[str]
+    status: Optional[int] = None
+    content_type: Optional[str] = None
 
 def base_domain(host: str) -> str:
-    """
-    Best-effort base domain for subdomain scoping without guessing TLD lists.
-    For your stated requirement ("all subdomains under our domain"), you can also
-    just pass --site-domain yourcorp.com explicitly.
-    """
+    # Simple base-domain heuristic (good enough for same-site scoping).
+    # If you want PSL accuracy, swap in `publicsuffix2`, but that adds a dep.
     parts = host.split(".")
     if len(parts) <= 2:
         return host
     return ".".join(parts[-2:])
 
-
-def host_endswith(host: str, suffix: str) -> bool:
-    host = (host or "").lower()
-    suffix = (suffix or "").lower().lstrip(".")
-    return host == suffix or host.endswith("." + suffix)
-
-
-def parse_cookie_kv(s: str) -> Tuple[str, str]:
-    if "=" not in s:
-        raise ValueError("Cookie must be NAME=VALUE")
-    name, val = s.split("=", 1)
-    name, val = name.strip(), val.strip()
-    if not name or not val:
-        raise ValueError("Cookie must be NAME=VALUE with non-empty name and value")
-    return name, val
-
-
-def parse_header_kv(s: str) -> Tuple[str, str]:
-    if ":" not in s:
-        raise ValueError("Header must be 'Name: Value'")
-    k, v = s.split(":", 1)
-    k, v = k.strip(), v.strip()
-    if not k or not v:
-        raise ValueError("Header must be 'Name: Value' with non-empty values")
-    return k, v
-
-
-# -----------------------------
-# Data model
-# -----------------------------
-@dataclass
-class EndpointRecord:
-    url: str
-    method: str
-    status: Optional[int] = None
-    content_type: Optional[str] = None
-    final_url: Optional[str] = None
-    title: Optional[str] = None
-    html_sha256: Optional[str] = None
-    dom_sha256: Optional[str] = None
-    error: Optional[str] = None
-
-
-@dataclass
-class CrawlReport:
-    root: str
-    role: str
-    visited: List[str]
-    endpoint_index: Dict[str, EndpointRecord]
-    xhr_index: Dict[str, Dict[str, Any]]
-    node_count: int
-    edge_count: int
-    edges: List[Tuple[str, str]]
-
-
-# -----------------------------
-# DOM extraction (no guessing; only what’s in source/DOM)
-# -----------------------------
-JS_EXTRACT_LINKS = r"""
-() => {
-  const out = new Set();
-
-  function add(u) {
-    if (!u) return;
-    try { out.add(String(u)); } catch(e) {}
-  }
-
-  // Standard anchors
-  for (const a of document.querySelectorAll("a[href]")) add(a.getAttribute("href"));
-
-  // Forms
-  for (const f of document.querySelectorAll("form[action]")) add(f.getAttribute("action"));
-
-  // Script/link/image assets sometimes encode API paths as well
-  for (const s of document.querySelectorAll("script[src]")) add(s.getAttribute("src"));
-  for (const l of document.querySelectorAll("link[href]")) add(l.getAttribute("href"));
-  for (const i of document.querySelectorAll("img[src]")) add(i.getAttribute("src"));
-
-  // Common data-* attributes and inline handlers that contain URLs
-  const urlishAttrs = ["data-href", "data-url", "data-endpoint", "data-action", "href", "src"];
-  for (const el of document.querySelectorAll("*")) {
-    for (const attr of urlishAttrs) {
-      if (el.hasAttribute && el.hasAttribute(attr)) add(el.getAttribute(attr));
-    }
-  }
-
-  // Also scan raw HTML for obvious URL patterns (still "inspect source", not brute forcing)
-  // Keep conservative: only capture things that look like paths/urls
-  const html = document.documentElement.outerHTML || "";
-  const re = /(?:https?:\/\/[^\s"'<>]+|\/[A-Za-z0-9._~!$&'()*+,;=:@\/%-]+)/g;
-  const m = html.match(re) || [];
-  for (const x of m) add(x);
-
-  return Array.from(out);
-}
-"""
-
-
-def normalize_discovered_url(root: str, discovered: str) -> Optional[str]:
-    discovered = (discovered or "").strip()
-    if not discovered:
-        return None
-    # Ignore javascript:, mailto:, tel:
-    lower = discovered.lower()
-    if lower.startswith("javascript:") or lower.startswith("mailto:") or lower.startswith("tel:"):
-        return None
-    # Resolve relative URLs against current root
-    abs_url = urljoin(root, discovered)
-    abs_url = canonicalize_url(abs_url)
-    return abs_url
-
-
-# -----------------------------
-# Scope policy (your requirement: include subdomains in-scope)
-# -----------------------------
-def in_scope(url: str, root: str, site_domain: Optional[str], allow_origins: List[str], deny_origins: List[str]) -> bool:
-    pu, pr = urlparse(url), urlparse(root)
-    if pu.scheme not in ("http", "https"):
+def in_scope(candidate: str, root: str, scope_mode: str) -> bool:
+    cu, ru = urlparse(candidate), urlparse(root)
+    ch = (cu.hostname or "").lower()
+    rh = (ru.hostname or "").lower()
+    if not ch or not rh:
         return False
+    if scope_mode == "same-host":
+        return ch == rh
+    # same-site: include subdomains of base domain of root
+    return ch == rh or ch.endswith("." + base_domain(rh)) or ch == base_domain(rh)
 
-    # Explicit deny
-    for d in deny_origins:
-        try:
-            pd = urlparse(d)
-            if pu.scheme == pd.scheme and pu.hostname == pd.hostname and (pu.port == pd.port):
-                return False
-        except Exception:
-            pass
+def normalize_url(found: str, current: str) -> Optional[str]:
+    if not found:
+        return None
+    found = found.strip()
+    # Ignore JS pseudo-URLs
+    if found.startswith("javascript:") or found.startswith("mailto:") or found.startswith("tel:"):
+        return None
+    # Resolve relative URLs
+    absu = urljoin(current, found)
+    absu, _frag = urldefrag(absu)
+    pu = urlparse(absu)
+    if pu.scheme not in ("http", "https"):
+        return None
+    return absu
 
-    # Explicit allow wins
-    for a in allow_origins:
-        try:
-            pa = urlparse(a)
-            if pu.scheme == pa.scheme and pu.hostname == pa.hostname and (pu.port == pa.port):
-                return True
-        except Exception:
-            pass
+def extract_from_html(html: str, page_url: str) -> Tuple[Set[str], Set[str]]:
+    """
+    Returns:
+      (page_links, script_links) discovered from HTML source.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    links: Set[str] = set()
+    scripts: Set[str] = set()
 
-    # Default: same "site domain" (subdomains allowed)
-    host = pu.hostname or ""
-    if site_domain:
-        return host_endswith(host, site_domain)
-    # fallback: derive base domain from root host
-    return host_endswith(host, base_domain(pr.hostname or ""))
+    # A) href/action/src extraction
+    for a in soup.find_all("a"):
+        href = a.get("href")
+        nu = normalize_url(href, page_url)
+        if nu:
+            links.add(nu)
 
+    for form in soup.find_all("form"):
+        action = form.get("action")
+        nu = normalize_url(action, page_url)
+        if nu:
+            links.add(nu)
 
-# -----------------------------
-# Crawl engine
-# -----------------------------
-async def apply_auth(context: BrowserContext, root: str, bearer: Optional[str], cookies: List[Tuple[str, str]]) -> None:
-    # Bearer token handled via headers in context setup (preferred).
-    # Cookies: set for root hostname and path "/"
-    if not cookies:
-        return
-    parsed = urlparse(root)
-    domain = parsed.hostname
-    if not domain:
-        return
-    cookie_objs = []
-    for (name, value) in cookies:
-        cookie_objs.append(
-            {
-                "name": name,
-                "value": value,
-                "domain": domain,
-                "path": "/",
-                "expires": -1,
-                "httpOnly": False,
-                "secure": parsed.scheme == "https",
-                "sameSite": "Lax",
-            }
-        )
-    await context.add_cookies(cookie_objs)
+    for el in soup.find_all(["iframe", "frame"]):
+        src = el.get("src")
+        nu = normalize_url(src, page_url)
+        if nu:
+            links.add(nu)
 
+    for s in soup.find_all("script"):
+        src = s.get("src")
+        if src:
+            nu = normalize_url(src, page_url)
+            if nu:
+                scripts.add(nu)
 
-async def crawl_role(
-    root: str,
-    role: str,
-    bearer: Optional[str],
-    cookies: List[Tuple[str, str]],
-    max_pages: int,
-    timeout_ms: int,
-    settle_ms: int,
-    headful: bool,
-    site_domain: Optional[str],
-    allow_origins: List[str],
-    deny_origins: List[str],
-    user_agent: str,
-    accept: str,
-    accept_language: str,
-    extra_headers: List[Tuple[str, str]],
-    include_xhr_cross_origin: bool,
-) -> CrawlReport:
-    visited: Set[str] = set()
-    edges: List[Tuple[str, str]] = []
-    endpoint_index: Dict[str, EndpointRecord] = {}
-    xhr_index: Dict[str, Dict[str, Any]] = {}
+    # B) inline script URL extraction
+    for s in soup.find_all("script"):
+        if s.get("src"):
+            continue
+        txt = s.get_text() or ""
+        txt = unescape(txt)
+        for pat in JS_URL_PATTERNS:
+            for m in pat.finditer(txt):
+                # last group contains the path
+                path = m.groups()[-1]
+                nu = normalize_url(path, page_url)
+                if nu:
+                    links.add(nu)
 
-    # Build default headers (overrideable)
-    headers: Dict[str, str] = {
-        "Accept": accept,
-        "Accept-Language": accept_language,
-        "Upgrade-Insecure-Requests": "1",
-    }
-    if bearer:
-        headers["Authorization"] = f"Bearer {bearer}"
-    # Apply user-provided extra headers
-    for k, v in extra_headers:
-        headers[k] = v
+    return links, scripts
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=not headful)
-        context = await browser.new_context(
-            user_agent=user_agent,
-            extra_http_headers=headers,
-        )
+def extract_routes_from_js(js_text: str, base_url: str) -> Set[str]:
+    out: Set[str] = set()
+    txt = unescape(js_text)
 
-        await apply_auth(context, root, bearer, cookies)
+    # Direct patterns first
+    for pat in JS_URL_PATTERNS:
+        for m in pat.finditer(txt):
+            path = m.groups()[-1]
+            nu = normalize_url(path, base_url)
+            if nu:
+                out.add(nu)
 
-        page = await context.new_page()
-        page.set_default_timeout(timeout_ms)
-
-        # Capture XHR/fetch responses as telemetry
-        def on_response(resp):
-            try:
-                rurl = canonicalize_url(resp.url)
-                rtype = resp.request.resource_type
-                # We record XHR/fetch always; crawl only scope-qualified later.
-                if rtype in ("xhr", "fetch"):
-                    pu = urlparse(rurl)
-                    pr = urlparse(root)
-                    same_site = host_endswith(pu.hostname or "", site_domain or base_domain(pr.hostname or ""))
-                    if same_site or include_xhr_cross_origin:
-                        key = f"{resp.request.method} {rurl}"
-                        xhr_index[key] = {
-                            "url": rurl,
-                            "method": resp.request.method,
-                            "status": resp.status,
-                            "resource_type": rtype,
-                            "content_type": resp.headers.get("content-type"),
-                        }
-            except Exception:
-                pass
-
-        page.on("response", on_response)
-
-        q: List[str] = [canonicalize_url(root)]
-        while q and len(visited) < max_pages:
-            current = q.pop(0)
-            if current in visited:
-                continue
-            if not in_scope(current, root, site_domain, allow_origins, deny_origins):
-                continue
-
-            visited.add(current)
-            rec = EndpointRecord(url=current, method="GET")
-            try:
-                resp = await page.goto(current, wait_until="domcontentloaded")
-                await page.wait_for_timeout(settle_ms)
-                rec.final_url = canonicalize_url(page.url)
-                rec.title = await page.title()
-                if resp is not None:
-                    rec.status = resp.status
-                    rec.content_type = resp.headers.get("content-type")
-                # Capture HTML + DOM hashes (engineering-reviewable diffs)
-                html = await page.content()
-                rec.html_sha256 = sha256_text(html)
-                # DOM snapshot (outerHTML already approximates; we hash separately anyway)
-                dom = await page.evaluate("() => document.documentElement.outerHTML || ''")
-                rec.dom_sha256 = sha256_text(dom)
-
-                # Extract links strictly from source/DOM (no bruteforce)
-                raw_links = await page.evaluate(JS_EXTRACT_LINKS)
-                new_links: List[str] = []
-                for rl in raw_links:
-                    norm = normalize_discovered_url(rec.final_url or current, rl)
-                    if not norm:
-                        continue
-                    if not in_scope(norm, root, site_domain, allow_origins, deny_origins):
-                        continue
-                    new_links.append(norm)
-
-                # Record edges
-                for nl in new_links:
-                    edges.append((current, nl))
-                    if nl not in visited and nl not in q:
-                        q.append(nl)
-
-            except Exception as e:
-                rec.error = str(e)
-
-            endpoint_index[current] = rec
-
-        await context.close()
-        await browser.close()
-
-    report = CrawlReport(
-        root=root,
-        role=role,
-        visited=sorted(list(visited)),
-        endpoint_index={k: v for k, v in endpoint_index.items()},
-        xhr_index=xhr_index,
-        node_count=len(visited),
-        edge_count=len(edges),
-        edges=edges,
-    )
-    return report
-
-
-def serialize_report(report: CrawlReport) -> Dict[str, Any]:
-    out = asdict(report)
-    # Convert endpoint_index EndpointRecord dataclasses
-    out["endpoint_index"] = {k: asdict(v) for k, v in report.endpoint_index.items()}
+    # Conservative fallback: route-like literals
+    for m in ROUTE_LITERAL.finditer(txt):
+        path = m.group(2)
+        # drop obvious assets
+        if STATIC_EXT.search(path):
+            continue
+        # drop extremely noisy patterns
+        if path.count("{") or path.count("}"):
+            continue
+        nu = normalize_url(path, base_url)
+        if nu:
+            out.add(nu)
     return out
 
+async def fetch(client: httpx.AsyncClient, url: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    try:
+        r = await client.get(url, follow_redirects=True)
+        ct = r.headers.get("content-type", "")
+        body = r.text if "text" in ct or "html" in ct or "javascript" in ct else None
+        return r.status_code, ct, body
+    except Exception:
+        return None, None, None
 
-# -----------------------------
-# CLI
-# -----------------------------
-def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="DOMgrabV5 - behavioral authorization mapper (link/DOM-driven traversal, no guessing)."
-    )
-    sub = p.add_subparsers(dest="cmd", required=True)
+async def crawl(root: str, cookie_kv: str, scope_mode: str, max_pages: int, concurrency: int, download_js: bool, outdir: str,
+               user_agent: str, accept: str, accept_lang: str) -> None:
+    t0 = time.time()
+    ru = urlparse(root)
+    if not ru.scheme:
+        root = "https://" + root
 
-    d = sub.add_parser("discover", help="Discover application surface for one role (cookie/bearer optional).")
-    d.add_argument("url", help="Root URL to start from (e.g., https://app.example.com)")
-    d.add_argument("--role", default="default", help="Label for this role (used in output files).")
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": accept,
+        "Accept-Language": accept_lang,
+    }
+    cookies = {}
+    # cookie_kv = "SESSION=..."
+    if "=" in cookie_kv:
+        k, v = cookie_kv.split("=", 1)
+        cookies[k] = v
+    else:
+        raise SystemExit("--cookie must be like NAME=value (e.g., SESSION=abc)")
 
-    # Auth
-    d.add_argument("--bearer-token", default=None, help="Bearer token (optional).")
-    d.add_argument("--cookie-name", default=None, help="Cookie name (legacy).")
-    d.add_argument("--cookie-value", default=None, help="Cookie value (legacy).")
-    d.add_argument(
-        "--cookie",
-        action="append",
-        default=[],
-        help="Repeatable: supply cookies as NAME=VALUE (recommended). Example: --cookie SESSION=abc",
-    )
+    limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
+    timeout = httpx.Timeout(20.0, connect=10.0)
 
-    # Scope
-    d.add_argument(
-        "--site-domain",
-        default=None,
-        help="Treat this domain and all subdomains as in-scope (e.g., example.com). If omitted, derived from root host.",
-    )
-    d.add_argument("--allow-origin", action="append", default=[], help="Repeatable allowlist origin (scheme+host).")
-    d.add_argument("--deny-origin", action="append", default=[], help="Repeatable denylist origin (scheme+host).")
-    d.add_argument(
-        "--include-xhr-cross-origin",
-        action="store_true",
-        help="Record cross-origin XHR/fetch as telemetry (does not crawl them).",
-    )
+    discovered: Dict[str, Endpoint] = {}
+    edges: Dict[str, Set[str]] = defaultdict(set)
+    visited: Set[str] = set()
+    q = deque([root])
 
-    # Runtime
-    d.add_argument("--max-pages", type=int, default=200, help="Maximum pages to visit.")
-    d.add_argument("--timeout", type=int, default=30000, help="Navigation/action timeout in ms.")
-    d.add_argument("--settle-ms", type=int, default=800, help="Delay after domcontentloaded to allow SPA hydration.")
-    d.add_argument("--headful", action="store_true", help="Run browser headful (debug).")
-    d.add_argument("--out-prefix", default="domgrab", help="Output prefix (files will be <prefix>.<role>.json).")
+    async with httpx.AsyncClient(headers=headers, cookies=cookies, timeout=timeout, limits=limits) as client:
+        sem = asyncio.Semaphore(concurrency)
 
-    # Hard-coded defaults with override options
-    d.add_argument("--user-agent", default=DEFAULT_UA, help="User-Agent header (default is Chrome/Windows UA).")
-    d.add_argument("--accept", default=DEFAULT_ACCEPT, help="Accept header (default is browser-like).")
-    d.add_argument("--accept-language", default=DEFAULT_ACCEPT_LANGUAGE, help="Accept-Language header.")
-    d.add_argument(
-        "--header",
-        action="append",
-        default=[],
-        help="Repeatable extra header: 'Name: Value' (overrides defaults if same key).",
-    )
+        async def worker(url: str):
+            async with sem:
+                status, ct, body = await fetch(client, url)
+                return url, status, ct, body
 
-    return p
+        while q and len(visited) < max_pages:
+            batch: List[str] = []
+            while q and len(batch) < concurrency and len(visited) + len(batch) < max_pages:
+                u = q.popleft()
+                if u in visited:
+                    continue
+                if not in_scope(u, root, scope_mode):
+                    continue
+                batch.append(u)
 
+            if not batch:
+                break
 
-async def main_async(args: argparse.Namespace) -> int:
-    if args.cmd != "discover":
-        print("Only 'discover' is implemented in this streamlined build.", file=sys.stderr)
-        return 2
+            results = await asyncio.gather(*(worker(u) for u in batch))
 
-    root = canonicalize_url(args.url)
+            for url, status, ct, body in results:
+                visited.add(url)
+                if url not in discovered:
+                    discovered[url] = Endpoint(url=url, discovered_from=[])
+                discovered[url].status = status
+                discovered[url].content_type = ct
 
-    # Cookies: prefer --cookie; support legacy --cookie-name/value
-    cookies: List[Tuple[str, str]] = []
-    for c in args.cookie:
-        cookies.append(parse_cookie_kv(c))
-    if args.cookie_name and args.cookie_value:
-        cookies.append((args.cookie_name, args.cookie_value))
+                if not body:
+                    continue
 
-    extra_headers: List[Tuple[str, str]] = []
-    for h in args.header:
-        extra_headers.append(parse_header_kv(h))
+                # Only parse HTML pages for links; JS handling below
+                if "html" in (ct or ""):
+                    links, scripts = extract_from_html(body, url)
 
-    report = await crawl_role(
-        root=root,
-        role=args.role,
-        bearer=args.bearer_token,
-        cookies=cookies,
+                    for nu in links:
+                        if not in_scope(nu, root, scope_mode):
+                            continue
+                        edges[url].add(nu)
+                        if nu not in discovered:
+                            discovered[nu] = Endpoint(url=nu, discovered_from=[url])
+                        else:
+                            discovered[nu].discovered_from.append(url)
+                        if nu not in visited:
+                            q.append(nu)
+
+                    # Optionally fetch same-scope JS bundles and extract routes
+                    if download_js:
+                        for jsu in scripts:
+                            if not in_scope(jsu, root, scope_mode):
+                                continue
+                            # fetch JS bundle quickly
+                            j_status, j_ct, j_body = await fetch(client, jsu)
+                            if j_body and ("javascript" in (j_ct or "") or jsu.endswith(".js")):
+                                js_routes = extract_routes_from_js(j_body, url)
+                                for nu in js_routes:
+                                    if not in_scope(nu, root, scope_mode):
+                                        continue
+                                    edges[url].add(nu)
+                                    if nu not in discovered:
+                                        discovered[nu] = Endpoint(url=nu, discovered_from=[f"js:{jsu}"])
+                                    else:
+                                        discovered[nu].discovered_from.append(f"js:{jsu}")
+                                    if nu not in visited:
+                                        q.append(nu)
+
+    # Write outputs
+    import os
+    os.makedirs(outdir, exist_ok=True)
+
+    endpoints_path = os.path.join(outdir, "endpoints.json")
+    tree_path = os.path.join(outdir, "tree.json")
+    summary_path = os.path.join(outdir, "summary.json")
+
+    with open(endpoints_path, "w") as f:
+        json.dump({k: asdict(v) for k, v in discovered.items()}, f, indent=2)
+
+    with open(tree_path, "w") as f:
+        json.dump({k: sorted(list(v)) for k, v in edges.items()}, f, indent=2)
+
+    summary = {
+        "root": root,
+        "scope_mode": scope_mode,
+        "download_js": download_js,
+        "visited_count": len(visited),
+        "discovered_count": len(discovered),
+        "edge_count": sum(len(v) for v in edges.values()),
+        "max_pages": max_pages,
+        "concurrency": concurrency,
+        "elapsed_sec": round(time.time() - t0, 2),
+        "outdir": outdir,
+    }
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+def main():
+    ap = argparse.ArgumentParser(description="Fast source-driven authenticated endpoint discovery (no clicking, no guessing).")
+    ap.add_argument("root", help="Root URL to crawl (e.g., https://x.example.com/)")
+    ap.add_argument("--cookie", required=True, help="Cookie as NAME=value (e.g., SESSION=abc123). No login performed.")
+    ap.add_argument("--scope-mode", choices=["same-host", "same-site"], default="same-site",
+                    help="same-host stays on exact host. same-site includes subdomains under the root base domain.")
+    ap.add_argument("--max-pages", type=int, default=1500)
+    ap.add_argument("--concurrency", type=int, default=25)
+    ap.add_argument("--download-js", action="store_true",
+                    help="Fetch same-scope JS bundles and extract route/API paths from their source.")
+    ap.add_argument("--outdir", default=f"authgrab_out/fast_{int(time.time())}")
+
+    # Hard-coded defaults with override capability (as requested)
+    ap.add_argument("--user-agent", default=DEFAULT_UA)
+    ap.add_argument("--accept", default=DEFAULT_ACCEPT)
+    ap.add_argument("--accept-language", default=DEFAULT_ACCEPT_LANG)
+
+    args = ap.parse_args()
+    asyncio.run(crawl(
+        root=args.root,
+        cookie_kv=args.cookie,
+        scope_mode=args.scope_mode,
         max_pages=args.max_pages,
-        timeout_ms=args.timeout,
-        settle_ms=args.settle_ms,
-        headful=args.headful,
-        site_domain=args.site_domain,
-        allow_origins=args.allow_origin,
-        deny_origins=args.deny_origin,
+        concurrency=args.concurrency,
+        download_js=args.download_js,
+        outdir=args.outdir,
         user_agent=args.user_agent,
         accept=args.accept,
-        accept_language=args.accept_language,
-        extra_headers=extra_headers,
-        include_xhr_cross_origin=args.include_xhr_cross_origin,
-    )
-
-    out_obj = serialize_report(report)
-    out_file = f"{args.out_prefix}.{args.role}.json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(out_obj, f, indent=2)
-
-    # Short console summary
-    # (This is where you should have seen more than 1 node if auth/headers worked.)
-    root_rec = out_obj["endpoint_index"].get(root) or out_obj["endpoint_index"].get(root.rstrip("/"))
-    status = root_rec.get("status") if root_rec else None
-    title = root_rec.get("title") if root_rec else None
-    print(f"[+] Wrote {out_file}")
-    print(f"[+] Visited pages: {out_obj['node_count']}  Edges: {out_obj['edge_count']}  XHR: {len(out_obj['xhr_index'])}")
-    print(f"[+] Root status: {status}  title: {title}")
-    return 0
-
-
-def main() -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args()
-    try:
-        return asyncio.run(main_async(args))
-    except KeyboardInterrupt:
-        return 130
-
+        accept_lang=args.accept_language
+    ))
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
