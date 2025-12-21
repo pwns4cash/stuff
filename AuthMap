@@ -4,7 +4,7 @@
 #  An authenticated, source-driven application behavior mapper used to derive authorization expectations and detect enforcement gaps.
 #  
 #
-#  python3 AuthMap.py --cookie session=xxxxxxxxxxxxxxxxxx --scope-mode same-host https://example.com
+#  python3 AuthMap.py --cookie session=xxxxxxxxxxxxxxxxxx --scope-mode same-host --outdir userA https://example.com
 #  diff -u <old_outdir>/endpoints.json <new_outdir>/endpoints.json
 #
 #  jq -r 'keys[]' endpoints.json | sort -u > burp_urls.txt
@@ -18,7 +18,7 @@
 # comm -23 user.txt admin.txt > suspicious_acl.txt
 
 
-
+#!/usr/bin/env python3
 import argparse
 import asyncio
 import json
