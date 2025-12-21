@@ -6,11 +6,18 @@
 #
 #  python3 AuthMap.py --cookie session=xxxxxxxxxxxxxxxxxx --scope-mode same-host https://example.com
 #  diff -u <old_outdir>/endpoints.json <new_outdir>/endpoints.json
-#  jq -r 'keys[]' endpoints.json | sort -u > burp_urls.txt
 #
-#  cat burp_urls.txt | while read url; do
+#  jq -r 'keys[]' endpoints.json | sort -u > burp_urls.txt
+#  cat burp_urls.txt | while read url; do                                   <-----recipe to dump results into burp
 #  curl -k -x http://127.0.0.1:8080 "$url" 
 #  done
+#
+# jq -r 'keys[]' user/endpoints.json | sort -u > user.txt
+# jq -r 'keys[]' admin/endpoints.json | sort -u > admin.txt                           <---------discover BFLA and IDOR
+# comm -13 user.txt admin.txt > adminonly.txt
+# comm -23 user.txt admin.txt > suspicious_acl.txt
+
+
 
 import argparse
 import asyncio
